@@ -1,0 +1,129 @@
+#!/bin/env perl
+
+use strict;
+use warnings;
+
+use Carp;
+use LWP::UserAgent ();
+use HTTP::Status qw( :constants status_message );
+
+#########################################################################
+# Settings
+
+my $VERSION = '1.0';
+
+# process mbox even if mbox_url has no changes?
+my $force = 0;
+
+# Do we want to be noisy?
+my $verbose = 1;
+
+# How we identify ourselves.
+my $agent = "HarleyPig CESA Scraper/$VERSION";
+
+# Directory locations
+my $base_dir = 'CESA_files';
+my $base_url = 'http://lists.centos.org/pipermail/centos-announce';
+my $mbox_dir = "$base_dir/mbox";
+
+#########################################################################
+# Checks
+
+if ( ! -e $base_dir ) {
+  mkdir $base_dir
+    or croak "Unable to create basedir: $!";
+}
+
+croak "$base_dir exists but is not a directory"
+  unless -d _;
+
+if ( ! -e $mbox_dir ) {
+  mkdir $mbox_dir
+    or croak "Unable to create mbox_dir: $!";
+}
+
+croak "$mbox_dir exists but is not a directory"
+  unless -d _;
+
+#########################################################################
+# Functions
+
+sub get_mbox { ## no critic qw( Subroutines::RequireFinalReturn )
+
+  my ( $d ) = @_;
+
+  my $file_gz       = "$d.txt.gz";
+  my $mbox_url      = "$base_url/$file_gz";
+  my $local_file_gz = "$mbox_dir/$file_gz";
+
+  mirror_file( $mbox_url, $local_file_gz );
+
+}
+
+sub mirror_file { ## no critic qw( Subroutines::RequireFinalReturn )
+
+  my ( $url, $file ) = @_;
+
+  warn "Getting $file\n" if $verbose;
+
+  my $ua = LWP::UserAgent->new;
+  $ua->agent( $agent );
+
+  my $response = $ua->mirror( $url, $file );
+
+  my $rc = $response->code;
+
+  if ( $rc == HTTP_NOT_MODIFIED ) {
+
+    my $msg = "No changes in $file since it was last processed";
+
+    if ( $force ) {
+
+      warn "$msg, continuing anyway.\n" if $verbose;
+
+    } else {
+
+      warn "$msg. Skipping.\n";
+
+    }
+
+  } elsif ( $rc != HTTP_OK ) {
+
+    carp sprintf "Unable to get %s for CESA reports (%d %s).\n", $file, $rc, status_message( $rc );
+
+  }
+} ## end sub mirror_file
+
+# Starting month year is March 2005
+# Ending month year is today.
+
+my %month = qw(
+  0 January
+  1 February
+  2 March
+  3 April
+  4 May
+  5 June
+  6 July
+  7 August
+  8 September
+  9 October
+  10 November
+  11 December
+);
+
+my ( $this_month, $this_year ) = ( localtime )[ 4 .. 5 ];
+$this_year += 1900;
+
+for my $year ( 2005 .. $this_year ) {
+  for my $month ( 0 .. 11 ) {
+
+    next if ( $month < 2 ) && ( $year == 2005 );
+    last if ( $month > $this_month ) && ( $year == $this_year );
+
+    my $filename = sprintf '%4d-%s', $year, $month{ $month };
+
+    get_mbox( $filename );
+
+  }
+}

@@ -1,0 +1,546 @@
+#!/usr/bin/perl
+
+# You need my custom version of Email::Folder::Mbox at
+# git://github.com/harleypig/email-folder.git
+
+use strict;
+use warnings;
+
+use DateTime::Format::Strptime;
+use Email::Folder::Mbox;
+use Email::Simple;
+use File::Copy;
+use File::Slurp 'slurp';
+use HTTP::Status qw':constants status_message';
+use LWP::UserAgent;
+use Mail::Box::Mbox;
+use POSIX qw'strftime';
+
+use MediaWiki::API;
+
+our $VERSION = 1.0;
+
+###################################################################################
+# To be converted to options
+
+my $verbose    = 1;
+
+my $base_dir   = 'CESA';
+my $base_url   = 'http://lists.centos.org/pipermail/centos-announce';
+my $date       = verify_date( shift || '' );
+my $force      = 1; # process mbox even if mbox_url has no changes?
+my $tmpl_file  = 'CESA/node_template';
+my $wiki_login = 'Automated';
+my $wiki_pswd  = 'v3r10';
+my $wiki_url   = 'http://wiki.qalab.net/api.php';
+
+#
+###################################################################################
+
+my $mbox_dir  = "$base_dir/mbox";
+my $rhsa_dir  = "$base_dir/RHSA";
+my $node_dir  = "$base_dir/nodes";
+my $node_tmpl = slurp( $tmpl_file ); # croaks on failure
+
+my $ua = LWP::UserAgent->new;
+$ua->agent( "Verio CESA Scraper/$VERSION" );
+
+get_mbox( $date );
+
+my $mw = wiki_login();
+
+process_mbox( $date );
+
+warn "Done.\n" if $verbose;
+exit;
+
+###################################################################################
+
+sub verify_date {
+
+  my ( $d ) = @_;
+  my @now = gmtime;
+  my $date;
+
+  if ( $d ne '' ) {
+
+    my $now_year  = strftime( '%Y', @now );
+    my $now_month = strftime( '%m', @now );
+
+    my @month = ( qw( January February March April May June July August September October November December ));
+    my $month_rx = join '|', @month;
+    my $bad_month_rx = join '|', @month[ $now_month .. @month-1 ];
+
+    die "Invalid format for date.  Needs to be YYYY-Month (You provided $d)\n"
+      unless $d =~ /^(\d{4})-($month_rx)$/i;
+
+    my ( $year, $month ) = ( $1, $2 );
+
+    die "No archives exist before 2005-March\n"
+      if $year < 2005 || $d =~ /^2005-(?:January|February)$/i;
+
+    die "Can't get future archives yet\n"
+      if $d =~ /^$now_year-(?:$bad_month_rx)$/
+      || $year > $now_year;
+
+    $month = ucfirst lc $month;
+
+    $date = sprintf '%4d-%s', $year, $month;
+
+  } else {
+
+    $date = strftime( '%Y-%B', @now );
+
+  }
+
+  warn "Using $date\n" if $verbose;
+  return $date;
+
+}
+
+sub get_mbox {
+
+  my ( $d ) = @_;
+
+  my $file_gz       = "$d.txt.gz";
+  my $mbox_url      = "$base_url/$file_gz";
+  my $local_file_gz = "$mbox_dir/$file_gz";
+
+  mirror_file( $mbox_url, $local_file_gz );
+
+}
+
+sub mirror_file {
+
+  my ( $url, $file ) = @_;
+
+  warn "Getting $url\n" if $verbose;
+
+  my $response = $ua->mirror( $url, $file );
+  my $rc = $response->code;
+
+  if ( $rc == HTTP_NOT_MODIFIED ) {
+
+    my $msg = "No changes in $url since it was last processed";
+
+    if ( $force ) {
+
+      warn "$msg, continuing anyway.\n" if $verbose;
+
+    } else {
+
+      die "$msg. Exiting.\n";
+
+    }
+
+  } elsif ( $rc != HTTP_OK ) {
+
+    die sprintf "Unable to get %s for CESA reports (%d %s).\n", $url, $rc, status_message( $rc );
+
+  }
+}
+
+sub wiki_login {
+
+  my $mw;
+
+  $mw = MediaWiki::API->new({
+
+    'api_url'  => $wiki_url,
+    'on_error' => sub { die sprintf "%s: %s\n", @{ $mw->{ error } }{qw( code details )} },
+
+  });
+
+  warn "logging in to wiki\n" if $verbose;
+
+  $mw->login({
+
+    'lgname'     => $wiki_login,
+    'lgpassword' => $wiki_pswd,
+
+  });
+
+  return $mw;
+
+}
+
+sub wiki_savenode {
+
+  my ( $title, $text ) = @_;
+
+  warn "Saving $title ...\n" if $verbose;
+
+  $mw->edit({
+
+    'action' => 'edit',
+    'title'  => $title,
+    'bot'    => 1,
+    'text'   => $text,
+
+  });
+}
+
+sub process_mbox {
+
+  my ( $d ) = @_;
+
+  my $workfile = "$mbox_dir/$d.txt.gz";
+
+  warn "Opening $workfile ...\n" if $verbose;
+
+  my $mbox = Email::Folder::Mbox->new( $workfile, 'jwz_From_' => 1 );
+
+  my ( %category, %seen );
+
+  my @info_fields = qw( cesa cesa_type cesa_year cesa_number cesa_priority release arch app );
+
+  warn "Looping through messages ...\n" if $verbose;
+
+  my $date_parser = DateTime::Format::Strptime->new( pattern => '%a' );
+
+  for my $msg ( map { Email::Simple->new( $_ ) } $mbox->messages ) {
+
+    my $subject = $msg->header( 'Subject' );
+    $subject =~ s/\s+/ /g;
+
+    next if $seen{ $subject }++; # What is causing duplicate msgs to be generated? There aren't any dupes in the file ...
+    next unless $subject =~ /CE.A/;
+
+    next if $subject =~ /CENTOSPLUS/;
+    next if $subject =~ /CESA naming conventions/;
+    next if $subject =~ /CE.A-YYYY:NNN/;
+    next if $subject =~ /CE.A-\d+:xxx/; # No sequence number
+    next if $subject =~ /CE.A.*CentOS\s+(i386|x86_64)/; # No release number
+    next if $subject =~ /(Re|http):/;
+    next if $subject =~ /errata.*correction/;
+    next if $subject =~/end of life/;
+
+    # http://lists.centos.org/pipermail/centos-announce/2005-March/011517.html
+    # Naming conventions (some changes have been made over the years)
+
+    # Subject:  [CentOS-announce] CESA-$NUMBER: $priority CentOS $release $arch $package - $brief_description
+    # $NUMBER is a redhat reference number or YYYYMMDD-SEQ
+
+    # [CentOS-announce] CESA-2005:354 Moderate CentOS 3 ia64 tetex - security update
+    # [CentOS-announce] CESA-2005:344: Important CentOS 3 i386 gtk2 - security update
+    # [CentOS-announce] CESA=2004:412 Moderate CentOS 3 x86_64 openmotif - security update
+
+    # IGNORE (No release number): [CentOS-announce] CESA-2005:504 Moderate CentOS i386 telnet - security update
+
+    $subject =~ s/CentOS Low 3/Low CentOS 3/; # [CentOS-announce] CESA-2005:256 CentOS Low 3 i386 glibc - security update
+    $subject =~ s/CentOS 3 Low/Low CentOS 3/; # [CentOS-announce] CESA-2005:256 CentOS 3 Low i386 glibc - security update
+
+    my $subject_rx = qr{
+      \s*
+      \[CentOS-announce\]
+      \s*
+      ((CE.A)[:=-](?:\w*[:=-])?(\d{4})[:-]([\d-]+)):?
+      \s*
+      (.*?)?
+      \s*CentOS
+      (?:-|\s*)
+      ([\d\.]+)
+      \s*
+      (\S+)
+      \s*
+      (\S+)
+      .*
+    }xi;
+
+    $subject =~ /^$subject_rx$/i;
+
+    my %hash;
+    my ( $cesa, $cesa_type, $cesa_year, $cesa_number, $cesa_priority, $release, $arch, $app ) = @hash{ @info_fields } = ( $1, $2, $3, $4, $5, $6, $7, $8 );
+    $cesa_priority ||= $hash{ priority } ||= 'Update';
+
+    $hash{ title }      = sprintf '%s_%s_%s_CentOS_%s_%s_%s_%s', @hash{qw( cesa_type cesa_year cesa_number release arch cesa_priority app )};
+
+    $release = "Release_$release";
+
+    # All_byYear
+    #   YYYY
+    #     YYYYNN
+    # All_byPriority
+    #   PPPP
+    # All_byApplication
+    #   AAAA
+    # All_byArch
+    #   ARCH
+    # All_byRelease
+    #   RRRR
+    # All_byType
+    #   CE?A
+    #     CE?A_byYear
+    #       CE?A_YYYY
+    #         CE?A_YYYYMM
+    #     CE?A_byPriority
+    #       CE?A_PPPP
+    #     CE?A_byApp
+    #       CE?A_AAAA
+    #     CE?A_byArch
+    #       CE?A_ARCH
+    #     CE?A_byRelease
+    #       CE?A_RRRR
+
+    my $all_YYYY   = $category{ 'All_byYear'     } ||= {};
+    my $all_PPPP   = $category{ 'All_byPriority' } ||= {};
+    my $all_AAAA   = $category{ 'All_byApp'      } ||= {};
+    my $all_ARCH   = $category{ 'All_byArch'     } ||= {};
+    my $all_RRRR   = $category{ 'All_byRelease'  } ||= {};
+    my $all_TYPE   = $category{ 'All_byType'     } ||= {};
+
+    my $ct = $all_TYPE->{ $cesa_type } ||= {};
+
+    my $ct_YYYY   = $ct->{      "${cesa_type}_byYear"       } ||= {};
+    my $ct_PPPP   = $ct->{      "${cesa_type}_byPriority"   } ||= {};
+    my $ct_AAAA   = $ct->{      "${cesa_type}_byApp"        } ||= {};
+    my $ct_ARCH   = $ct->{      "${cesa_type}_byArch"       } ||= {};
+    my $ct_RRRR   = $ct->{      "${cesa_type}_byRelease"    } ||= {};
+
+    my $yn   = "${cesa_year}_$cesa_number";
+    my $cty  = "${cesa_type}_$cesa_year";
+    my $ctyn = "${cesa_type}_$yn";
+    my $ctp  = "${cesa_type}_$cesa_priority";
+    my $ctap = "${cesa_type}_$app";
+    my $ctar = "${cesa_type}_$arch";
+    my $crel = "${cesa_type}_$release";
+
+    $ct_YYYY->{   $cty  }{ $ctyn }++;
+    $ct_PPPP->{   $ctp  }++;
+    $ct_AAAA->{   $ctap }++;
+    $ct_ARCH->{   $ctar }++;
+    $ct_RRRR->{   $crel }++;
+
+    $all_YYYY->{   $cesa_year     }{ $yn }++;
+    $all_PPPP->{   $cesa_priority }++;
+    $all_AAAA->{   $app           }++;
+    $all_ARCH->{   $arch          }++;
+    $all_RRRR->{   $release }++;
+
+    my @categories;
+    push @categories, $cty, $ctyn, $ctp, $ctap, $ctar, $crel, $cesa_year, $yn, $cesa_priority, $app, $arch, $release;
+
+    no warnings 'uninitialized'; # FIXME
+    next if grep { $hash{ $_ } eq '' } @info_fields;
+
+    warn "Found $subject\n" if $verbose;
+
+    # Get and format the message date
+    my $date_header = $msg->header( 'Date' );
+
+    $date_parser->pattern( '%a %b %d %T %Y' );
+    my $parsed_date = $date_parser->parse_datetime( $date_header );
+
+    if ( $parsed_date eq '' ) {
+
+      $date_parser->pattern( '%a, %d %b %Y %T %z' );
+      $parsed_date = $date_parser->parse_datetime( $date_header );
+
+      die sprintf "Unknown date format in msg %s (%s).\n", $subject, $date_header
+        if $parsed_date eq '';
+
+    }
+
+    my @timestamp = gmtime( $parsed_date->epoch );
+
+    $hash{ email_timestamp } = strftime( '%A, %B %d, %Y', @timestamp );
+    $hash{ email_YYYY }      = strftime( '%Y',            @timestamp );
+    $hash{ email_YYYYMM }    = strftime( '%Y%m',          @timestamp );
+    $hash{ email_YYYYMMDD }  = strftime( '%Y%m%d',        @timestamp );
+
+    $hash{ now }             = strftime( '%Y-%m-%d %H:%M:%S',        gmtime );
+
+    # Email_byYear
+    #   Email_YYYY
+    #     Email_YYYYMM
+    #       Email_YYYYMMDD
+
+    my $email_YYYY     = "Email_$hash{ email_YYYY }";
+    my $email_YYYYMM   = "Email_$hash{ email_YYYYMM }";
+    my $email_YYYYMMDD = "Email_$hash{ email_YYYYMMDD }";
+
+    my $em          = $category{ 'Email_byYear' }     ||= {};
+    my $em_YYYY     = $em->{ $email_YYYY }            ||= {};
+    my $em_YYYYMM   = $em_YYYY->{ $email_YYYYMM }     ||= {};
+
+    $em_YYYYMM->{ $email_YYYYMMDD }++;
+
+    push @categories, $email_YYYY, $email_YYYYMM, $email_YYYYMMDD;
+
+    my $body = $msg->body;
+
+    # What's the RHSA data? Is it always a 1 to 1 mapping between a CESA and a RHSA?
+    ( $hash{ rhsa_url }, $hash{ rhsa } ) = ( $msg->body ) =~ m{(https://rhn.redhat.com/errata/(.*?)\.html)};
+    my ( $rhsa_year, $rhsa_number ) = $hash{ rhsa } =~ /^RHSA-(\d{4})-(.*)$/i;
+
+    # RHSA_byYear
+    #   RHSA_YYYY
+    #     RHSA_YYYYNN
+
+    my $rhsa_YYYY   = "RHSA_$rhsa_year";
+    my $rhsa_YYYYNN = "RHSA_${rhsa_year}_$rhsa_number";
+
+    my $rh = $category{ 'RHSA_byYear' } ||= {};
+    my $rh_YYYY = $rh->{ $rhsa_YYYY } ||= {};
+
+    $rh_YYYY->{ $rhsa_YYYYNN }++;
+
+    push @categories, $rhsa_YYYY, $rhsa_YYYYNN;
+
+    # Which CVEs are we looking at?
+    my %cves;
+
+    # Get the RHSA page.
+    my $rhsa_file = "$rhsa_dir/$hash{ rhsa }";
+    mirror_file( $hash{ rhsa_url }, $rhsa_file );
+
+    my $cves;
+    slurp( $rhsa_file, buf_ref => \$cves, err_mode => 'quiet' ); # We'll handle read failure later.
+
+    if ( $cves ) {
+
+      # Assume any link to a specific CVE is relevant to this issue.
+      my @cves = $cves =~ m{(https?://www.redhat.com/security/data/cve/CVE-\d{4}-.*?\.html?)}g;
+
+      if ( @cves ) {
+
+        my %seen;
+
+        for my $url ( sort @cves ) {
+
+          next if $seen{ $url }++;
+
+          my ( $cve, $year, $number ) = $url =~ m{/(CVE-(\d{4})-(.*?))\.html?};
+
+          # CVE_byYear
+          #   CVE_YYYY
+          #     CVE_YYYY_NN
+
+          my $cve_year = "CVE_$year";
+          my $cve_num  = "CVE_${year}_${number}";
+
+          my $cv      = $category{ 'CVE_byYear' } ||= {};
+          my $cv_YYYY = $cv->{ $cve_year }        ||= {};
+
+          $cv_YYYY->{ $cve_num }++;
+
+          push @categories, $cve_year, $cve_num;
+
+          $hash{ cves } .= "*[$url $cve]\n";
+
+        }
+
+      } else {
+
+        $hash{ cves } = 'No CVEs found on RHSA page.';
+
+      }
+
+    } else {
+
+      $hash{ cves } = "Unable to open $rhsa_file: $!";
+
+    }
+
+    my @raw_packages = $msg->body =~ m{\n(?:[0-9a-fA-F]{32}\s+?)?(\S+?\.rpm)}g;
+
+    my ( %seen, @packages );
+
+    for my $package ( @raw_packages ) {
+
+      ( my $p = $package ) =~ s{^.*/}{};
+
+      next if $seen{ $p };
+      push @packages, $p;
+
+      my $pinfo = parse_rpm_name( $p );
+      next if $seen{ $pinfo->{ name } }++;
+
+      $category{ 'Packages' }{ $pinfo->{ name } }++;
+      push @categories, $pinfo->{ name };
+
+    }
+
+    $hash{ packages }   = join "\n", map { "*$_"             } sort @packages;
+    $hash{ categories } = join '',   map { "[[Category:$_]]" } @categories;
+
+    ( my $node = $node_tmpl ) =~ s/<<([^>]*)>>/$hash{ $1 }/g;
+
+    if ( ( ref $mw ) =~ /mediawiki/i ) {
+
+      wiki_savenode( $hash{ title }, $node );
+
+    }
+  }
+
+  create_category( \%category );
+
+}
+
+sub parse_rpm_name {
+
+  # From http://www.commandlinefu.com/commands/view/4386/parse-an-rpm-name-into-its-components-fast
+  # Don't know how reliable it is, but it's worked on everything I've tested so far.
+  # parse_rpm() { RPM=$1;B=${RPM##*/};B=${B%.rpm};A=${B##*.};B=${B%.*};R=${B##*-};B=${B%-*};V=${B##*-};B=${B%-*};N=$B;echo "$N $V $R $A"; }
+  #
+  # RPM=$1                                                  package name
+  # B=${RPM##*/}        B=tzdata-java-2011l-4.el5.i386.rpm  strip everything from the beginning of the string RPM to the last / and assign the result to B
+  # B=${B%.rpm}         B=tzdata-java-2011l-4.el5.i386      strip '.rpm' from the end of the string in B
+  # A=${B##*.}          B=tzdata-java-2011l-4.el5.i386      strip everything up to the last '.' in the string B and assign the result to A (architecture) (A=i386)
+  # B=${B%.*}           B=tzdata-java-2011l-4.el5           strip everything from the last period to the end of the string in B
+  # R=${B##*-}          B=tzdata-java-2011l-4.el5           strip everything from the beginning of the string B to the last - and assign the result to R (release) (R=4.el5)
+  # B=${B%-*}           B=tzdata-java-2011l                 strip everything from the last - in the string B to the end of the string
+  # V=${B##*-}          B=tzdata-java-2011l                 strip everything from the beginning of the string to the last dash and assing the result to V (version) (V=2011l)
+  # B=${B%-*}           B=tzdata-java                       strip everything from the last - in the string B to the end of the string
+  # N=$B                                                    assign B to N (name) (N=tzdata-java)
+  # echo "$N $V $R $A"                                      print the info: tzdata-java 2011l 4.el5 i386
+
+  my ( $rpm ) = @_;
+  my $mpr = reverse $rpm;
+  my ( $src, $arch, $release, $version, $name ) = $mpr =~ /^mpr\.(crs\.)?(.*?)\.(.*?)-(.*?)-(.*)$/i;
+
+  $src = 0 unless $src;
+
+  my %info = (
+    name    => ( join '', reverse split //, $name ),
+    version => ( join '', reverse split //, $version ),
+    release => ( join '', reverse split //, $release ),
+    arch    => ( join '', reverse split //, $arch ),
+    src     => !! $src,
+  );
+
+  return \%info;
+
+}
+
+sub create_category {
+
+  my ( $c, @parents ) = @_;
+
+  for my $key ( sort keys %$c ) {
+
+    #printf "%s%s %s\n", $indent, $key, @parents;
+
+    my $title      = "Category:$key";
+    my $categories = join '', map { "[[Category:$_]]" } @parents;
+    my $now        = strftime( '%Y-%m-%d %H:%M:%S', gmtime );
+    my $text       = "This index page automatically generated $now.$categories";
+
+    wiki_savenode( $title, $text );
+
+    my $type = ref $c->{ $key };
+
+    if ( $type eq 'HASH' ) {
+
+#      my @p = ( @parents, $key );
+
+#      create_category( $c->{ $key }, @p );
+      create_category( $c->{ $key }, $key );
+
+    } elsif ( $type ne '' ) {
+
+      die "Unhandled ref type ($key $type)!\n";
+
+    }
+  }
+}
